@@ -1,1032 +1,462 @@
 'use strict';
 
 require('dotenv').config();
-
-const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 
-const PORT = Number(process.env.PORT || 3000);
-const MONGODB_URI = String(process.env.MONGODB_URI || '').trim();
-const MONGODB_DB = String(process.env.MONGODB_DB || 'symplasys_erp').trim();
-const API_KEY = String(process.env.API_KEY || '').trim();
-const CORS_ORIGIN = String(process.env.CORS_ORIGIN || '*').trim();
-
-if (!MONGODB_URI) {
-  console.warn('[AVISO] MONGODB_URI não configurado. Configure o arquivo .env antes de iniciar em produção.');
-}
-if (!API_KEY) {
-  console.warn('[AVISO] API_KEY não configurada. As rotas /api ficarão bloqueadas até configurar.');
-}
-
 const app = express();
-app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN }));
-app.use(express.json({ limit: '2mb' }));
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || '';
+const MONGODB_URI = process.env.MONGODB_URI || '';
+const MONGODB_DB = process.env.MONGODB_DB || '';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const JWT_SECRET = process.env.JWT_SECRET || API_KEY || 'symplasys-local-secret';
 
 let mongoClient = null;
 let mongoDb = null;
 
-function nowIso() {
-  return new Date().toISOString();
-}
+app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-function makeId(prefix) {
-  const raw = typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString('hex');
-  return String(prefix || 'id') + '_' + raw.replace(/-/g, '').slice(0, 24);
+function nowIso() { return new Date().toISOString(); }
+function ok(data, message, meta) { return { success: true, data: data, message: message || 'OK', version: Date.now(), meta: meta || {} }; }
+function fail(message, status, details) { const e = new Error(message || 'Erro'); e.status = status || 400; e.details = details || null; return e; }
+function sendError(res, error) { return res.status(error.status || 500).json({ success: false, data: null, message: error.message || 'Erro interno.', version: Date.now(), details: error.details || null }); }
+function s(v) { return v === undefined || v === null ? '' : String(v).trim(); }
+function n(v) { const x = Number(v); return Number.isFinite(x) ? x : 0; }
+function b(v) { return v === true || v === 'true' || v === 1 || v === '1'; }
+function oid() { return new ObjectId(); }
+function id(v) { return v ? String(v) : ''; }
+function onlyDigits(v) { return s(v).replace(/\D/g, ''); }
+function hashText(text) { return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex'); }
+function makeSalt() { return crypto.randomBytes(16).toString('hex'); }
+function signToken(payload) {
+  const body = Buffer.from(JSON.stringify(Object.assign({}, payload, { iat: Date.now() }))).toString('base64url');
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(body).digest('base64url');
+  return body + '.' + sig;
 }
-
-function asString(value) {
-  return String(value === undefined || value === null ? '' : value).trim();
+function verifyToken(token) {
+  if (!token || !String(token).includes('.')) return null;
+  const parts = String(token).split('.');
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(parts[0]).digest('base64url');
+  if (sig !== parts[1]) return null;
+  try { return JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); } catch (e) { return null; }
 }
-
-function asNumber(value) {
-  const text = String(value === undefined || value === null ? '0' : value)
-    .replace(/\./g, '')
-    .replace(',', '.');
-  const num = Number(text);
-  return Number.isFinite(num) ? num : 0;
-}
-
-function isActive(value) {
-  const text = asString(value).toLowerCase();
-  return text === '' || text === 'ativo' || text === 'active' || text === 'sim' || text === 'true';
-}
-
-function isValidObjectId(value) {
-  return ObjectId.isValid(asString(value));
-}
-
-function toObjectIdOrNull(value) {
-  return isValidObjectId(value) ? new ObjectId(asString(value)) : null;
-}
-
 function publicDoc(doc) {
   if (!doc) return null;
   const out = Object.assign({}, doc);
-  if (out._id) {
-    out.mongoId = String(out._id);
-    delete out._id;
-  }
+  if (out._id) { out.id = String(out._id); out.mongoId = String(out._id); delete out._id; }
+  delete out.Senha;
+  delete out.Salt;
+  delete out.senha;
+  delete out.passwordHash;
+  delete out.senhaCertificado;
+  delete out.certificadoDigital;
+  delete out.CertificadoMX;
+  delete out.ChavePrivadaMX;
+  delete out.NFCeToken;
+  delete out.IFoodClientSecret;
+  delete out.IFoodToken;
   return out;
 }
+function publicDocs(docs) { return (docs || []).map(publicDoc); }
 
-function publicDocs(docs) {
-  return (docs || []).map(publicDoc);
-}
-
-function ok(data, message, meta) {
-  return {
-    success: true,
-    data: data === undefined ? null : data,
-    message: message || 'Sucesso.',
-    version: Date.now(),
-    meta: meta || {}
-  };
-}
-
-function fail(message, statusCode, details) {
-  const error = new Error(message || 'Erro ao processar solicitação.');
-  error.statusCode = statusCode || 400;
-  error.details = details || null;
-  return error;
-}
-
-function sendError(res, error) {
-  const statusCode = Number(error && error.statusCode) || 500;
-  res.status(statusCode).json({
-    success: false,
-    data: null,
-    message: error && error.message ? error.message : 'Erro interno.',
-    version: Date.now(),
-    details: error && error.details ? error.details : null
-  });
-}
-
-async function connectMongo() {
+async function db() {
   if (mongoDb) return mongoDb;
-  if (!MONGODB_URI) throw fail('MONGODB_URI não configurado no backend.', 500);
-
-  mongoClient = new MongoClient(MONGODB_URI, {
-    maxPoolSize: 20,
-    serverSelectionTimeoutMS: 12000
-  });
-
+  if (!MONGODB_URI || !MONGODB_DB) throw fail('MONGODB_URI ou MONGODB_DB não configurado.', 500);
+  mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 20000, connectTimeoutMS: 20000 });
   await mongoClient.connect();
   mongoDb = mongoClient.db(MONGODB_DB);
-  await ensureIndexes(mongoDb);
-  console.log('[OK] MongoDB conectado:', MONGODB_DB);
   return mongoDb;
 }
 
-async function ensureIndexes(db) {
-  await Promise.all([
-    db.collection('produtos').createIndex({ sku: 1 }, { unique: true, sparse: true }),
-    db.collection('produtos').createIndex({ codigoBarras: 1 }, { sparse: true }),
-    db.collection('produtos').createIndex({ status: 1, nome: 1 }),
-    db.collection('clientes').createIndex({ documento: 1 }, { sparse: true }),
-    db.collection('clientes').createIndex({ telefone: 1 }, { sparse: true }),
-    db.collection('clientes').createIndex({ status: 1, nome: 1 }),
-    db.collection('vendedores').createIndex({ status: 1, nome: 1 }),
-    db.collection('caixas').createIndex({ status: 1, usuarioId: 1, vendedorId: 1, terminal: 1, dataAbertura: -1 }),
-    db.collection('pedidos').createIndex({ numero: 1 }, { unique: true, sparse: true }),
-    db.collection('pedidos').createIndex({ caixaId: 1, status: 1, criadoEm: -1 }),
-    db.collection('pedido_itens').createIndex({ pedidoId: 1 }),
-    db.collection('estoque_movimentos').createIndex({ produtoId: 1, criadoEm: -1 }),
-    db.collection('caixa_movimentos').createIndex({ caixaId: 1, criadoEm: -1 }),
-    db.collection('counters').createIndex({ chave: 1 }, { unique: true })
-  ]);
+async function count(col, filter) { return (await db()).collection(col).countDocuments(filter || {}); }
+async function one(col, filter, sort) { return (await db()).collection(col).find(filter || {}).sort(sort || {}).limit(1).next(); }
+async function many(col, filter, options) {
+  options = options || {};
+  let q = (await db()).collection(col).find(filter || {});
+  if (options.sort) q = q.sort(options.sort);
+  if (options.limit) q = q.limit(options.limit);
+  if (options.project) q = q.project(options.project);
+  return q.toArray();
 }
-
-async function db() {
-  return connectMongo();
+async function insert(col, doc) { const r = await (await db()).collection(col).insertOne(doc); return Object.assign({}, doc, { _id: r.insertedId }); }
+async function update(col, filter, patch, options) { return (await db()).collection(col).updateOne(filter, patch, options || {}); }
+async function writeLog(tipo, payload, usuario) {
+  try { await insert('symplasys_writeback_log', { LastUpdate: nowIso(), tipo, usuario: usuario || null, payload }); } catch (e) {}
 }
 
 function requireApiKey(req, res, next) {
-  try {
-    if (!API_KEY) throw fail('API_KEY não configurada no backend.', 500);
-    const provided = asString(req.get('x-api-key') || req.query.apiKey);
-    if (!provided || provided !== API_KEY) {
-      throw fail('Acesso negado: chave da API inválida.', 401);
-    }
-    next();
-  } catch (error) {
-    sendError(res, error);
-  }
+  const key = req.query.apiKey || req.get('x-api-key') || req.body.apiKey;
+  if (!API_KEY || key !== API_KEY) return res.status(401).json({ success: false, data: null, message: 'API_KEY inválida.', version: Date.now() });
+  return next();
 }
-
-function normalizeProduto(payload) {
-  const sku = asString(payload.sku || payload.SKU || payload.codigo || payload.Cod_produto);
-  const nome = asString(payload.nome || payload.Nome || payload.descricao || payload.Descricao_item);
-  if (!sku) throw fail('SKU do produto é obrigatório.');
-  if (!nome) throw fail('Nome do produto é obrigatório.');
-  return {
-    publicId: asString(payload.publicId || payload.id) || makeId('prd'),
-    sku: sku,
-    codigoBarras: asString(payload.codigoBarras || payload.ean || payload.EAN),
-    nome: nome,
-    categoria: asString(payload.categoria || payload.Categoria || 'Geral'),
-    marca: asString(payload.marca || payload.Marca || payload.industria || payload.Industria),
-    precoVenda: asNumber(payload.precoVenda || payload.preco || payload.PrecoVenda),
-    custo: asNumber(payload.custo || payload.Custo),
-    estoqueAtual: asNumber(payload.estoqueAtual || payload.estoque || payload.EstoqueAtual),
-    estoqueMinimo: asNumber(payload.estoqueMinimo || payload.EstoqueMinimo),
-    status: asString(payload.status || payload.Status || 'Ativo'),
-    origem: asString(payload.origem || 'manual'),
-    atualizadoEm: nowIso()
-  };
-}
-
-function normalizeCliente(payload) {
-  const nome = asString(payload.nome || payload.Nome);
-  if (!nome) throw fail('Nome do cliente é obrigatório.');
-  return {
-    publicId: asString(payload.publicId || payload.id) || makeId('cli'),
-    nome: nome,
-    telefone: asString(payload.telefone || payload.Telefone),
-    email: asString(payload.email || payload.Email),
-    documento: asString(payload.documento || payload.cpfCnpj || payload.Documento),
-    endereco: asString(payload.endereco || payload.Endereco),
-    status: asString(payload.status || payload.Status || 'Ativo'),
-    atualizadoEm: nowIso()
-  };
-}
-
-function normalizeVendedor(payload) {
-  const nome = asString(payload.nome || payload.Nome);
-  if (!nome) throw fail('Nome do vendedor é obrigatório.');
-  return {
-    publicId: asString(payload.publicId || payload.id) || makeId('ven'),
-    nome: nome,
-    email: asString(payload.email || payload.Email),
-    telefone: asString(payload.telefone || payload.Telefone),
-    metaMensal: asNumber(payload.metaMensal || payload.MetaMensal),
-    comissaoPercentual: asNumber(payload.comissaoPercentual || payload.ComissaoPercentual),
-    status: asString(payload.status || payload.Status || 'Ativo'),
-    atualizadoEm: nowIso()
-  };
-}
-
-function activeFilter(extra) {
-  return Object.assign({ status: { $in: ['Ativo', 'ativo', 'ACTIVE', 'Active', '', null] } }, extra || {});
-}
-
-async function nextSequence(chave, startAt) {
-  const database = await db();
-  const result = await database.collection('counters').findOneAndUpdate(
-    { chave: chave },
-    { $inc: { valor: 1 }, $setOnInsert: { criadoEm: nowIso() } },
-    { upsert: true, returnDocument: 'after' }
-  );
-  const valor = result && result.value && Number(result.value.valor) ? Number(result.value.valor) : Number(startAt || 1000);
-  if (valor === 1 && Number(startAt || 0) > 1) {
-    await database.collection('counters').updateOne({ chave: chave }, { $set: { valor: Number(startAt) } });
-    return Number(startAt);
-  }
-  return valor;
-}
-
-async function findProduto(identifier) {
-  const database = await db();
-  const id = asString(identifier);
-  const or = [{ publicId: id }, { sku: id }, { codigoBarras: id }];
-  const objectId = toObjectIdOrNull(id);
-  if (objectId) or.push({ _id: objectId });
-  return database.collection('produtos').findOne({ $or: or });
-}
-
-async function findVendedor(identifier) {
-  const database = await db();
-  const id = asString(identifier);
-  const or = [{ publicId: id }, { email: id }];
-  const objectId = toObjectIdOrNull(id);
-  if (objectId) or.push({ _id: objectId });
-  return database.collection('vendedores').findOne({ $or: or });
-}
-
-async function findCliente(identifier) {
-  const database = await db();
-  const id = asString(identifier);
-  if (!id) return null;
-  const or = [{ publicId: id }, { documento: id }, { telefone: id }, { email: id }];
-  const objectId = toObjectIdOrNull(id);
-  if (objectId) or.push({ _id: objectId });
-  return database.collection('clientes').findOne({ $or: or });
-}
-
-async function getCaixaAberto(params) {
-  const database = await db();
-  const filtro = { status: 'ABERTO' };
-  if (asString(params.usuarioId)) filtro.usuarioId = asString(params.usuarioId);
-  if (asString(params.vendedorId)) filtro.vendedorId = asString(params.vendedorId);
-  if (asString(params.terminal)) filtro.terminal = asString(params.terminal);
-  return database.collection('caixas').findOne(filtro, { sort: { dataAbertura: -1 } });
-}
-
-app.get('/health', async function(req, res) {
-  try {
-    const database = await db();
-    await database.command({ ping: 1 });
-    res.json(ok({ status: 'online', db: MONGODB_DB, hora: nowIso() }, 'API e MongoDB online.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
 app.use('/api', requireApiKey);
 
-app.get('/api/boot', async function(req, res) {
-  try {
-    const database = await db();
-    const limite = Math.min(Number(req.query.limite || 150), 500);
-    const usuarioId = asString(req.query.usuarioId || req.query.usuario || '');
-    const vendedorId = asString(req.query.vendedorId || '');
-    const terminal = asString(req.query.terminal || 'PDV-01');
-
-    const [produtos, clientes, vendedores, pedidosRecentes, caixaAberto] = await Promise.all([
-      database.collection('produtos').find(activeFilter()).sort({ nome: 1 }).limit(limite).toArray(),
-      database.collection('clientes').find(activeFilter()).sort({ nome: 1 }).limit(limite).toArray(),
-      database.collection('vendedores').find(activeFilter()).sort({ nome: 1 }).limit(limite).toArray(),
-      database.collection('pedidos').find({}).sort({ criadoEm: -1 }).limit(50).toArray(),
-      getCaixaAberto({ usuarioId: usuarioId, vendedorId: vendedorId, terminal: terminal })
-    ]);
-
-    const totalVendidoHoje = await database.collection('pedidos').aggregate([
-      { $match: { origem: 'PDV', status: { $nin: ['Cancelado', 'CANCELADO'] }, criadoEm: { $gte: new Date().toISOString().slice(0, 10) } } },
-      { $group: { _id: null, total: { $sum: '$total' }, quantidade: { $sum: 1 } } }
-    ]).toArray();
-
-    const dashboard = {
-      totalProdutos: produtos.length,
-      totalClientes: clientes.length,
-      totalVendedores: vendedores.length,
-      totalPedidosRecentes: pedidosRecentes.length,
-      vendasHoje: totalVendidoHoje[0] ? Number(totalVendidoHoje[0].total || 0) : 0,
-      qtdVendasHoje: totalVendidoHoje[0] ? Number(totalVendidoHoje[0].quantidade || 0) : 0
-    };
-
-    res.json(ok({
-      fonte: 'MONGODB',
-      terminal: terminal,
-      dashboard: dashboard,
-      produtos: publicDocs(produtos),
-      clientes: publicDocs(clientes),
-      vendedores: publicDocs(vendedores),
-      pedidos: publicDocs(pedidosRecentes),
-      estoque: publicDocs(produtos).map(function(produto) {
-        return {
-          id: produto.publicId || produto.mongoId,
-          sku: produto.sku,
-          nome: produto.nome,
-          estoqueAtual: asNumber(produto.estoqueAtual),
-          estoqueMinimo: asNumber(produto.estoqueMinimo),
-          statusEstoque: asNumber(produto.estoqueAtual) <= asNumber(produto.estoqueMinimo) ? 'Baixo' : 'Ok'
-        };
-      }),
-      caixaAberto: publicDoc(caixaAberto)
-    }, 'Boot MongoDB carregado.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-app.get('/api/produtos', async function(req, res) {
-  try {
-    const database = await db();
-    const busca = asString(req.query.q);
-    const filtro = activeFilter();
-    if (busca) {
-      filtro.$or = [
-        { nome: { $regex: busca, $options: 'i' } },
-        { sku: { $regex: busca, $options: 'i' } },
-        { codigoBarras: { $regex: busca, $options: 'i' } }
-      ];
-    }
-    const docs = await database.collection('produtos').find(filtro).sort({ nome: 1 }).limit(500).toArray();
-    res.json(ok(publicDocs(docs), 'Produtos carregados do MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-app.get('/api/produtos/:identificador', async function(req, res) {
-  try {
-    const produto = await findProduto(req.params.identificador);
-    if (!produto) throw fail('Produto não encontrado.', 404);
-    res.json(ok(publicDoc(produto), 'Produto encontrado.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-app.get('/api/admin/mapa-completo', async function(req, res) {
-  try {
-    const database = await db();
-    const limiteAmostra = Math.min(Number(req.query.amostra || 3), 10);
-    const collections = await database.listCollections().toArray();
-    const mapa = [];
-
-    function detectarModulo(nome, campos) {
-      const alvo = (String(nome) + ' ' + campos.join(' ')).toLowerCase();
-
-      if (alvo.includes('produto') || alvo.includes('product') || alvo.includes('sku') || alvo.includes('ean') || alvo.includes('codigo_barras')) return 'Produtos';
-      if (alvo.includes('cliente') || alvo.includes('customer') || alvo.includes('cpf') || alvo.includes('cnpj') || alvo.includes('telefone')) return 'Clientes / CRM';
-      if (alvo.includes('vendedor') || alvo.includes('seller') || alvo.includes('usuario') || alvo.includes('user')) return 'Usuários / Vendedores';
-      if (alvo.includes('estoque') || alvo.includes('stock') || alvo.includes('inventory') || alvo.includes('saldo')) return 'Estoque';
-      if (alvo.includes('pedido') || alvo.includes('order') || alvo.includes('sale') || alvo.includes('venda')) return 'Pedidos / Vendas';
-      if (alvo.includes('caixa') || alvo.includes('cash') || alvo.includes('pdv') || alvo.includes('terminal')) return 'Caixa / PDV';
-      if (alvo.includes('pagamento') || alvo.includes('payment') || alvo.includes('pix') || alvo.includes('card')) return 'Pagamentos';
-      if (alvo.includes('nota') || alvo.includes('nfce') || alvo.includes('nfe') || alvo.includes('fiscal')) return 'Fiscal';
-      if (alvo.includes('whatsapp') || alvo.includes('mensagem') || alvo.includes('message') || alvo.includes('chat')) return 'WhatsApp / Atendimento';
-      if (alvo.includes('marketplace') || alvo.includes('mercadolivre') || alvo.includes('magento') || alvo.includes('shopify')) return 'Marketplaces';
-      if (alvo.includes('fornecedor') || alvo.includes('supplier') || alvo.includes('compra') || alvo.includes('purchase')) return 'Compras / Fornecedores';
-      if (alvo.includes('empresa') || alvo.includes('company') || alvo.includes('loja') || alvo.includes('tenant')) return 'Empresas / Lojas';
-
-      return 'Não identificado';
-    }
-
-    for (const col of collections) {
-      const nome = col.name;
-
-      if (String(nome).indexOf('system.') === 0) {
-        mapa.push({
-          collection: nome,
-          ignorada: true,
-          motivo: 'Collection interna do MongoDB ignorada por segurança.',
-          moduloProvavel: 'Sistema MongoDB',
-          totalDocumentos: null,
-          campos: [],
-          amostra: []
-        });
-        continue;
-      }
-
-      let total = 0;
-      let amostra = [];
-      let campos = [];
-      let erro = null;
-
-      try {
-        total = await database.collection(nome).countDocuments({});
-        amostra = await database.collection(nome).find({}).limit(limiteAmostra).toArray();
-
-        const mapaCampos = {};
-        amostra.forEach(function(doc) {
-          Object.keys(doc || {}).forEach(function(campo) {
-            mapaCampos[campo] = true;
-          });
-        });
-        campos = Object.keys(mapaCampos).slice(0, 120);
-      } catch (e) {
-        erro = e && e.message ? e.message : String(e);
-      }
-
-      mapa.push({
-        collection: nome,
-        ignorada: false,
-        moduloProvavel: detectarModulo(nome, campos),
-        totalDocumentos: total,
-        campos: campos,
-        amostra: typeof publicDocs === 'function' ? publicDocs(amostra) : amostra,
-        erro: erro
-      });
-    }
-
-    mapa.sort(function(a, b) {
-      return String(a.collection).localeCompare(String(b.collection));
-    });
-
-    return res.json(ok({
-      banco: process.env.MONGODB_DB,
-      totalCollections: mapa.length,
-      mapa: mapa
-    }, 'Mapa completo carregado.'));
-  } catch (error) {
-    return sendError(res, error);
-  }
-});
-
-
-app.get('/api/admin/collections-detalhadas', async function(req, res) {
-  try {
-    const database = await db();
-    const collections = await database.listCollections().toArray();
-    const lista = [];
-
-    for (const col of collections) {
-      const nome = col.name;
-      const exemplo = await database.collection(nome).findOne({});
-      let totalEstimado = 0;
-
-      try {
-        totalEstimado = await database.collection(nome).estimatedDocumentCount();
-      } catch (e) {
-        totalEstimado = 0;
-      }
-
-      const campos = exemplo ? Object.keys(exemplo).slice(0, 80) : [];
-      lista.push({
-        collection: nome,
-        tipo: col.type || 'collection',
-        totalEstimado: totalEstimado,
-        camposExemplo: campos,
-        moduloInferido: inferirModuloSymplaSys_(nome, campos)
-      });
-    }
-
-    lista.sort(function(a, b) {
-      return String(a.collection).localeCompare(String(b.collection));
-    });
-
-    res.json(ok(lista, 'Collections detalhadas carregadas.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-app.get('/api/admin/amostra/:collection', async function(req, res) {
-  try {
-    const collectionName = asString(req.params.collection);
-    const limite = Math.min(Number(req.query.limite || 5), 20);
-
-    if (!collectionName) throw fail('Informe o nome da collection.', 400);
-
-    const database = await db();
-    const docs = await database.collection(collectionName).find({}).limit(limite).toArray();
-
-    res.json(ok({
-      collection: collectionName,
-      totalAmostra: docs.length,
-      campos: extrairCamposMapa_(docs),
-      documentos: docs.map(sanitizarDocMapa_)
-    }, 'Amostra carregada.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-function sanitizarDocMapa_(doc) {
-  if (!doc) return null;
-  const bloqueados = ['senha', 'password', 'pass', 'token', 'secret', 'apikey', 'api_key', 'authorization', 'hash'];
-
-  function limpar(valor, caminho) {
-    if (valor === null || valor === undefined) return valor;
-
-    const chave = String(caminho || '').toLowerCase();
-    if (bloqueados.some(function(b) { return chave.indexOf(b) >= 0; })) {
-      return '***OCULTO***';
-    }
-
-    if (Array.isArray(valor)) {
-      return valor.slice(0, 5).map(function(v, i) { return limpar(v, caminho + '[' + i + ']'); });
-    }
-
-    if (valor instanceof Date) return valor.toISOString();
-
-    if (typeof valor === 'object') {
-      const out = {};
-      Object.keys(valor).slice(0, 80).forEach(function(k) {
-        if (k === '_id') out.mongoId = String(valor[k]);
-        else out[k] = limpar(valor[k], caminho ? caminho + '.' + k : k);
-      });
-      return out;
-    }
-
-    return valor;
-  }
-
-  return limpar(doc, '');
+async function getEmpresaPadrao() {
+  return await one('DtoEmpresa', { Padrao: true }) || await one('DtoEmpresa', {}) || null;
+}
+async function getConfiguracao() { return await one('DtoConfiguracao', {}) || {}; }
+async function getConfiguracaoNFe(empresaId) {
+  return await one('DtoConfiguracaoNFe', empresaId ? { EmpresaID: String(empresaId) } : {}) || await one('DtoConfiguracaoNFe', {}) || {};
+}
+async function getConsumidorNaoIdentificado() {
+  let cli = await one('DtoPessoa', { NomeFantasia: /Consumidor não identificado/i });
+  if (cli) return cli;
+  cli = {
+    _id: oid(), LastUpdate: nowIso(), PessoaFisica: false, NomeFantasia: 'Consumidor não identificado', RazaoSocial: null,
+    CNPJ_CPF: null, Cliente: false, Vendedor: false, CadastroInativo: false, Bloqueado: false, DataCadastro: nowIso()
+  };
+  await insert('DtoPessoa', cli);
+  return cli;
+}
+async function nextCodigo(seqCollection, field, start) {
+  const database = await db();
+  const r = await database.collection(seqCollection).findOneAndUpdate(
+    {},
+    { $inc: { [field]: 1 }, $setOnInsert: { createdAt: nowIso() } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  return n(r.value && r.value[field]) || start || 1;
 }
 
-function extrairCamposMapa_(docs) {
-  const mapa = {};
-
-  function tipoValor(v) {
-    if (v === null || v === undefined) return 'vazio';
-    if (Array.isArray(v)) return 'array';
-    if (v instanceof Date) return 'data';
-    return typeof v;
-  }
-
-  function percorrer(obj, prefixo) {
-    if (!obj || typeof obj !== 'object') return;
-    Object.keys(obj).forEach(function(k) {
-      const caminho = prefixo ? prefixo + '.' + k : k;
-      const valor = obj[k];
-      if (!mapa[caminho]) mapa[caminho] = { campo: caminho, tipos: {}, ocorrencias: 0 };
-      mapa[caminho].tipos[tipoValor(valor)] = (mapa[caminho].tipos[tipoValor(valor)] || 0) + 1;
-      mapa[caminho].ocorrencias += 1;
-      if (valor && typeof valor === 'object' && !Array.isArray(valor) && !(valor instanceof Date)) {
-        percorrer(valor, caminho);
-      }
-    });
-  }
-
-  (docs || []).forEach(function(doc) { percorrer(doc, ''); });
-
-  return Object.keys(mapa).sort().map(function(campo) {
-    return mapa[campo];
-  });
-}
-
-function inferirModuloSymplaSys_(collectionName, camposEntrada) {
-  const nome = String(collectionName || '').toLowerCase();
-  const campos = (camposEntrada || []).map(function(c) {
-    return String(c.campo || c).toLowerCase();
-  });
-  const texto = nome + ' ' + campos.join(' ');
-
-  function score(palavras) {
-    let pontos = 0;
-    palavras.forEach(function(p) {
-      if (texto.indexOf(String(p).toLowerCase()) >= 0) pontos += 1;
-    });
-    return pontos;
-  }
-
-  const regras = [
-    { modulo: 'Produtos', palavras: ['produto', 'product', 'sku', 'ean', 'barcode', 'codigo_barras', 'preco', 'price', 'descricao', 'description', 'marca', 'brand'] },
-    { modulo: 'Estoque', palavras: ['estoque', 'stock', 'inventory', 'saldo', 'warehouse', 'deposito', 'quantidade', 'quantity', 'available'] },
-    { modulo: 'Clientes', palavras: ['cliente', 'customer', 'client', 'pessoa', 'person', 'cpf', 'cnpj', 'telefone', 'phone', 'whatsapp', 'endereco', 'address'] },
-    { modulo: 'Vendedores', palavras: ['vendedor', 'seller', 'salesman', 'salesperson', 'comissao', 'commission', 'meta', 'goal'] },
-    { modulo: 'Usuarios', palavras: ['usuario', 'user', 'login', 'email', 'senha', 'password', 'perfil', 'role', 'permission'] },
-    { modulo: 'Pedidos/Vendas', palavras: ['pedido', 'order', 'venda', 'sale', 'sales', 'total', 'subtotal', 'checkout', 'cart', 'carrinho'] },
-    { modulo: 'Itens de Pedido', palavras: ['order_item', 'pedido_item', 'sale_item', 'item', 'produtoid', 'productid', 'quantidade', 'unitario'] },
-    { modulo: 'Caixa/PDV', palavras: ['caixa', 'cash', 'cashier', 'pdv', 'terminal', 'abertura', 'fechamento', 'sangria', 'suprimento'] },
-    { modulo: 'Pagamentos', palavras: ['pagamento', 'payment', 'pix', 'cartao', 'card', 'recebimento', 'receivable', 'transaction'] },
-    { modulo: 'Fiscal', palavras: ['nfe', 'nfce', 'fiscal', 'invoice', 'xml', 'danfe', 'sefaz', 'chave'] },
-    { modulo: 'WhatsApp/Atendimento', palavras: ['whatsapp', 'chat', 'message', 'mensagem', 'conversation', 'conversa', 'atendimento'] },
-    { modulo: 'Marketplaces', palavras: ['marketplace', 'mercadolivre', 'magento', 'shopee', 'shopify', 'woocommerce', 'nuvemshop', 'channel'] },
-    { modulo: 'Empresas/Lojas', palavras: ['empresa', 'company', 'loja', 'store', 'tenant', 'filial', 'branch', 'business'] },
-    { modulo: 'Compras/Fornecedores', palavras: ['compra', 'purchase', 'fornecedor', 'supplier', 'entrada', 'invoice_purchase'] },
-    { modulo: 'Auditoria/Logs', palavras: ['log', 'audit', 'history', 'historico', 'event', 'evento'] },
-    { modulo: 'Configuracoes', palavras: ['config', 'setting', 'preference', 'parametro', 'parameter'] }
+function matchPassword(raw, stored, salt) {
+  raw = String(raw || ''); stored = String(stored || ''); salt = String(salt || '');
+  if (!stored) return false;
+  const candidates = [
+    raw,
+    hashText(raw),
+    hashText(salt + raw),
+    hashText(raw + salt),
+    hashText(hashText(raw) + salt),
+    hashText(salt + hashText(raw))
   ];
-
-  let melhor = { modulo: 'Nao identificado', pontos: 0, palavras: [] };
-  regras.forEach(function(regra) {
-    const pontos = score(regra.palavras);
-    if (pontos > melhor.pontos) melhor = { modulo: regra.modulo, pontos: pontos, palavras: regra.palavras };
-  });
-
-  let confianca = 'baixa';
-  if (melhor.pontos >= 5) confianca = 'alta';
-  else if (melhor.pontos >= 2) confianca = 'media';
-
+  return candidates.some(v => String(v).toLowerCase() === stored.toLowerCase());
+}
+async function getLocalUserByLogin(login) {
+  const email = s(login).toLowerCase();
+  return await one('symplasys_usuarios', { emailLower: email });
+}
+async function findWhiteLabelPessoaByLogin(login) {
+  const loginStr = s(login);
+  const rx = new RegExp('^' + loginStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+  return await one('DtoPessoa', { $or: [ { EmailLoginEcommerce: rx }, { Email: rx }, { EmailComercial: rx }, { EmailFaturamento: rx }, { NomeFantasia: rx } ] });
+}
+function userPayloadFromPessoa(pessoa, perfil) {
   return {
-    modulo: melhor.modulo,
-    confianca: confianca,
-    pontos: melhor.pontos,
-    motivo: melhor.pontos ? 'Encontrou termos compatíveis no nome/campos.' : 'Não encontrou termos suficientes.'
+    id: id(pessoa && pessoa._id),
+    nome: pessoa.NomeFantasia || pessoa.RazaoSocial || pessoa.Email || 'Usuário',
+    email: pessoa.EmailLoginEcommerce || pessoa.Email || pessoa.EmailComercial || '',
+    perfil: perfil || (pessoa.Vendedor ? 'OPERADOR' : 'ADMIN'),
+    vendedorId: pessoa.Vendedor ? id(pessoa._id) : '',
+    vendedorNome: pessoa.Vendedor ? pessoa.NomeFantasia : '',
+    origem: 'DtoPessoa'
+  };
+}
+async function validarLogin(login, senha) {
+  login = s(login); senha = String(senha || '');
+  if (!login || !senha) throw fail('Informe login e senha.', 400);
+
+  const totalLocal = await count('symplasys_usuarios');
+  if (totalLocal === 0) {
+    const pessoa = await findWhiteLabelPessoaByLogin(login);
+    const salt = makeSalt();
+    const doc = {
+      _id: oid(), LastUpdate: nowIso(), nome: pessoa ? (pessoa.NomeFantasia || login) : login, email: login, emailLower: login.toLowerCase(),
+      passwordHash: hashText(salt + senha), salt, perfil: 'MASTER', ativo: true,
+      pessoaId: pessoa ? id(pessoa._id) : '', vendedorId: pessoa && pessoa.Vendedor ? id(pessoa._id) : '',
+      origem: 'BOOTSTRAP_MASTER'
+    };
+    await insert('symplasys_usuarios', doc);
+  }
+
+  const local = await getLocalUserByLogin(login);
+  if (local && local.ativo !== false && matchPassword(senha, local.passwordHash, local.salt)) {
+    let pessoa = null;
+    if (local.pessoaId) {
+      try { pessoa = await one('DtoPessoa', { _id: new ObjectId(local.pessoaId) }); } catch(e) {}
+    }
+    const payload = {
+      id: id(local._id), nome: local.nome || login, email: local.email, perfil: local.perfil || 'OPERADOR',
+      vendedorId: local.vendedorId || (pessoa && pessoa.Vendedor ? id(pessoa._id) : ''),
+      vendedorNome: local.vendedorNome || (pessoa && pessoa.Vendedor ? pessoa.NomeFantasia : ''),
+      pessoaId: local.pessoaId || '', origem: 'symplasys_usuarios'
+    };
+    return Object.assign(payload, { token: signToken(payload) });
+  }
+
+  const pessoa = await findWhiteLabelPessoaByLogin(login);
+  if (pessoa && pessoa.Bloqueado !== true && matchPassword(senha, pessoa.Senha, pessoa.Salt)) {
+    const payload = userPayloadFromPessoa(pessoa, pessoa.Vendedor ? 'OPERADOR' : 'ADMIN');
+    return Object.assign(payload, { token: signToken(payload) });
+  }
+  if (pessoa && (!pessoa.Senha || !pessoa.Salt)) throw fail('Usuário encontrado no white label, mas sem senha compatível. Cadastre o acesso no painel Usuários e vincule ao vendedor.', 401);
+  throw fail('Login ou senha inválidos.', 401);
+}
+
+async function produtosNormalizados(busca, limit) {
+  const filtro = busca ? { $or: [ { Nome: new RegExp(busca, 'i') }, { CodigoNFe: new RegExp(busca, 'i') }, { EAN_NFe: new RegExp(busca, 'i') }, { CodigoFornecedor: new RegExp(busca, 'i') } ] } : { OcultarNasVendas: { $ne: true } };
+  const prods = await many('DtoProduto', filtro, { limit: limit || 250, sort: { Nome: 1 } });
+  const ids = prods.map(p => id(p._id));
+  const precos = await many('DtoProdutoPreco', ids.length ? { ProdutoID: { $in: ids } } : {}, { limit: 1000 });
+  const saldos = await many('DtoEstoqueDepositoProduto', ids.length ? { ProdutoID: { $in: ids } } : {}, { limit: 1000 });
+  const imgs = await many('DtoImagemProduto', ids.length ? { ProdutoID: { $in: ids }, Principal: true } : {}, { limit: 1000 });
+  const precoMap = {}; precos.forEach(p => { if (!precoMap[p.ProdutoID]) precoMap[p.ProdutoID] = p; });
+  const saldoMap = {}; saldos.forEach(e => { if (!saldoMap[e.ProdutoID]) saldoMap[e.ProdutoID] = e; });
+  const imgMap = {}; imgs.forEach(i => { if (!imgMap[i.ProdutoID]) imgMap[i.ProdutoID] = i; });
+  return prods.map(p => {
+    const pid = id(p._id); const pr = precoMap[pid] || {}; const es = saldoMap[pid] || {}; const im = imgMap[pid] || {};
+    return {
+      id: pid, codigo: p.Codigo || p.CodigoNFe || pr.CodigoProduto || '', codigoNFe: p.CodigoNFe || '',
+      nome: p.Nome || pr.Produto || '', ean: p.EAN_NFe || p.EAN_UnidadeTributavel_NFe || '',
+      preco: n(pr.PrecoVenda || p.PrecoVenda), custo: n(pr.PrecoCusto || p.PrecoCusto),
+      estoque: n(es.Saldo), depositoId: es.DepositoID || '', deposito: es.Deposito || '', unidade: p.EstoqueUnidade || p.UnidadeComercial_NFe || 'UN',
+      categoria: p.Categoria || '', marca: p.Marca || '', ignoraEstoque: p.IgnorarEstoque === true,
+      ncm: p.NCM_NFe || '', cfop: p.CFOPPadrao_NFe || '', grupoTributario: p.GrupoTributario || '',
+      imagem: im.ImageUrlAwsJpeg185x139 || im.ImageUrlAwsWebp185x139 || im.ImageUrlAwsJpeg800x600 || ''
+    };
+  });
+}
+async function clientesNormalizados(busca, limit) {
+  const filtro = busca ? { $or: [ { NomeFantasia: new RegExp(busca, 'i') }, { RazaoSocial: new RegExp(busca, 'i') }, { CNPJ_CPF: new RegExp(onlyDigits(busca), 'i') }, { Telefone: new RegExp(busca, 'i') }, { Celular: new RegExp(busca, 'i') } ] } : { Cliente: true, CadastroInativo: { $ne: true } };
+  const docs = await many('DtoPessoa', filtro, { limit: limit || 250, sort: { NomeFantasia: 1 } });
+  return docs.map(p => ({ id: id(p._id), nome: p.NomeFantasia || p.RazaoSocial || 'Sem nome', razaoSocial: p.RazaoSocial || '', cpfCnpj: p.CNPJ_CPF || '', telefone: p.Telefone || p.Celular || '', email: p.Email || p.EmailComercial || '', cidade: p.Cidade || '', uf: p.UF || '', vendedor: p.Vendedor === true, cliente: p.Cliente === true }));
+}
+async function vendedoresNormalizados() {
+  const docs = await many('DtoPessoa', { Vendedor: true, CadastroInativo: { $ne: true }, Bloqueado: { $ne: true } }, { limit: 500, sort: { NomeFantasia: 1 } });
+  return docs.map(p => ({ id: id(p._id), nome: p.NomeFantasia || p.RazaoSocial || 'Vendedor', cpfCnpj: p.CNPJ_CPF || '', email: p.Email || p.EmailLoginEcommerce || '' }));
+}
+async function pagamentosNormalizados() {
+  const docs = await many('DtoFormaPagamento', {}, { limit: 100, sort: { Nome: 1 } });
+  return docs.map(p => ({ id: id(p._id), nome: p.Nome || '' }));
+}
+async function getVisualConfig() {
+  const empresa = await getEmpresaPadrao();
+  const cfg = await one('symplasys_config_visual', {}) || {};
+  return {
+    nomeSistema: cfg.nomeSistema || 'SymplaSys ERP',
+    nomeEmpresa: cfg.nomeEmpresa || (empresa && (empresa.NomeFantasia || empresa.RazaoSocial)) || 'Sua Empresa',
+    logoUrl: cfg.logoUrl || (empresa && empresa.Logo) || '',
+    corPrimaria: cfg.corPrimaria || '#262863',
+    corSecundaria: cfg.corSecundaria || '#6d5dfc',
+    modoEscuro: cfg.modoEscuro === true,
+    textoRodape: cfg.textoRodape || 'PDV White Label'
+  };
+}
+async function fiscalContext() {
+  const empresa = await getEmpresaPadrao();
+  const cfg = await getConfiguracao();
+  const nfe = await getConfiguracaoNFe(empresa && empresa._id);
+  const seq = await one('DtoSequencialNota', {}) || {};
+  return {
+    empresa: publicDoc(empresa),
+    configuracao: {
+      DocumentoEmissaoPDV: cfg.DocumentoEmissaoPDV || (empresa && empresa.DocumentoEmissaoPDV) || 'Nenhum',
+      NFCeEmitirAutomaticamente: cfg.NFCeEmitirAutomaticamente === true,
+      EscolherEmissaoDocumentoFinalizarVendaPDV: cfg.EscolherEmissaoDocumentoFinalizarVendaPDV === true,
+      EmitirNFCeEmContigenciaAutomaticamente: cfg.EmitirNFCeEmContigenciaAutomaticamente === true
+    },
+    nfe: {
+      configurado: !!(nfe && (nfe.certificadoDigital || nfe.CertificadoMX || nfe.UtilizarCertificadoA3)),
+      tipoCertificado: nfe.TipoCertificado || null,
+      utilizarA3: nfe.UtilizarCertificadoA3 === true,
+      validadeCertificado: nfe.DataValidadeCertificadoDigital || null,
+      ambienteNFe: nfe.NFEUtilizarHomologacao ? 'HOMOLOGACAO' : 'PRODUCAO',
+      ambienteNFCe: nfe.NFCEUtilizarHomologacao ? 'HOMOLOGACAO' : 'PRODUCAO',
+      serieNFCe: nfe.NFCeSerieNumeracao || seq.Serie || '1',
+      inicioNFCe: nfe.NFCeInicioNumeracao || 0,
+      proximoNFe: n(seq.NumeroNfe) + 1,
+      proximoNFCe: n(seq.NumeroNfce) + 1,
+      tokenConfigurado: !!(nfe.NFCeCodigoToken && nfe.NFCeToken)
+    }
   };
 }
 
-app.post('/api/produtos', async function(req, res) {
-  try {
-    const database = await db();
-    const doc = normalizeProduto(req.body || {});
-    doc.criadoEm = req.body && req.body.criadoEm ? asString(req.body.criadoEm) : nowIso();
-    await database.collection('produtos').updateOne(
-      { sku: doc.sku },
-      { $set: doc, $setOnInsert: { criadoEm: doc.criadoEm } },
-      { upsert: true }
-    );
-    const saved = await database.collection('produtos').findOne({ sku: doc.sku });
-    res.json(ok(publicDoc(saved), 'Produto salvo no MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+app.get('/health', async (req, res) => {
+  try { await db(); res.json(ok({ status: 'online', db: MONGODB_DB, hora: nowIso() }, 'API e MongoDB online.')); } catch (e) { sendError(res, e); }
 });
 
-app.get('/api/clientes', async function(req, res) {
-  try {
-    const database = await db();
-    const busca = asString(req.query.q);
-    const filtro = activeFilter();
-    if (busca) {
-      filtro.$or = [
-        { nome: { $regex: busca, $options: 'i' } },
-        { documento: { $regex: busca, $options: 'i' } },
-        { telefone: { $regex: busca, $options: 'i' } }
-      ];
-    }
-    const docs = await database.collection('clientes').find(filtro).sort({ nome: 1 }).limit(500).toArray();
-    res.json(ok(publicDocs(docs), 'Clientes carregados do MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+app.post('/api/auth/login', async (req, res) => {
+  try { const user = await validarLogin(req.body.login, req.body.senha); res.json(ok(user, 'Login realizado.')); } catch (e) { sendError(res, e); }
 });
 
-app.post('/api/clientes', async function(req, res) {
+app.get('/api/app/boot', async (req, res) => {
   try {
-    const database = await db();
-    const doc = normalizeCliente(req.body || {});
-    const chave = doc.documento ? { documento: doc.documento } : { publicId: doc.publicId };
-    await database.collection('clientes').updateOne(
-      chave,
-      { $set: doc, $setOnInsert: { criadoEm: nowIso() } },
-      { upsert: true }
-    );
-    const saved = await database.collection('clientes').findOne(chave);
-    res.json(ok(publicDoc(saved), 'Cliente salvo no MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    const [empresa, visual, fiscal, produtos, clientes, vendedores, formas, config] = await Promise.all([
+      getEmpresaPadrao(), getVisualConfig(), fiscalContext(), produtosNormalizados('', 250), clientesNormalizados('', 250), vendedoresNormalizados(), pagamentosNormalizados(), getConfiguracao()
+    ]);
+    const vendasHoje = await many('DtoVenda', {}, { limit: 30, sort: { Data: -1 } });
+    res.json(ok({
+      fonte: 'WHITELABEL', empresa: publicDoc(empresa), visual, fiscal, produtos, clientes, vendedores, formasPagamento: formas,
+      configPDV: publicDoc(config), pedidos: publicDocs(vendasHoje), dashboard: { totalProdutos: produtos.length, totalClientes: clientes.length, totalVendedores: vendedores.length, pedidosRecentes: vendasHoje.length }
+    }, 'Boot white label carregado.'));
+  } catch (e) { sendError(res, e); }
 });
 
-app.get('/api/vendedores', async function(req, res) {
+app.get('/api/pdv/boot', async (req, res) => {
   try {
-    const database = await db();
-    const docs = await database.collection('vendedores').find(activeFilter()).sort({ nome: 1 }).limit(500).toArray();
-    res.json(ok(publicDocs(docs), 'Vendedores carregados do MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    const usuario = verifyToken(req.query.token || req.get('x-session-token')) || null;
+    const [empresa, visual, fiscal, produtos, clientes, vendedores, formas, consumidor] = await Promise.all([
+      getEmpresaPadrao(), getVisualConfig(), fiscalContext(), produtosNormalizados('', 500), clientesNormalizados('', 300), vendedoresNormalizados(), pagamentosNormalizados(), getConsumidorNaoIdentificado()
+    ]);
+    let caixaAberto = null;
+    if (usuario && usuario.id) caixaAberto = await one('symplasys_caixas', { usuarioId: usuario.id, status: 'ABERTO' }, { abertoEm: -1 });
+    res.json(ok({ empresa: publicDoc(empresa), visual, fiscal, produtos, clientes, vendedores, formasPagamento: formas, consumidorNaoIdentificado: publicDoc(consumidor), caixaAberto: publicDoc(caixaAberto), usuario }, 'PDV carregado.'));
+  } catch (e) { sendError(res, e); }
 });
 
-app.post('/api/vendedores', async function(req, res) {
+app.get('/api/produtos', async (req, res) => { try { res.json(ok(await produtosNormalizados(s(req.query.q), n(req.query.limit) || 500), 'Produtos carregados.')); } catch(e){sendError(res,e);} });
+app.get('/api/clientes', async (req, res) => { try { res.json(ok(await clientesNormalizados(s(req.query.q), n(req.query.limit) || 500), 'Clientes carregados.')); } catch(e){sendError(res,e);} });
+app.get('/api/vendedores', async (req, res) => { try { res.json(ok(await vendedoresNormalizados(), 'Vendedores carregados.')); } catch(e){sendError(res,e);} });
+app.get('/api/formas-pagamento', async (req, res) => { try { res.json(ok(await pagamentosNormalizados(), 'Formas de pagamento carregadas.')); } catch(e){sendError(res,e);} });
+
+app.post('/api/clientes', async (req, res) => {
   try {
-    const database = await db();
-    const doc = normalizeVendedor(req.body || {});
-    const chave = doc.email ? { email: doc.email } : { publicId: doc.publicId };
-    await database.collection('vendedores').updateOne(
-      chave,
-      { $set: doc, $setOnInsert: { criadoEm: nowIso() } },
-      { upsert: true }
-    );
-    const saved = await database.collection('vendedores').findOne(chave);
-    res.json(ok(publicDoc(saved), 'Vendedor salvo no MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-app.get('/api/caixas/aberto', async function(req, res) {
-  try {
-    const caixa = await getCaixaAberto(req.query || {});
-    res.json(ok(publicDoc(caixa), caixa ? 'Caixa aberto encontrado.' : 'Nenhum caixa aberto encontrado.'));
-  } catch (error) {
-    sendError(res, error);
-  }
-});
-
-app.post('/api/caixas/abrir', async function(req, res) {
-  try {
-    const database = await db();
-    const payload = req.body || {};
-    const usuarioId = asString(payload.usuarioId || payload.usuario || payload.emailUsuario);
-    const vendedorId = asString(payload.vendedorId);
-    const terminal = asString(payload.terminal || 'PDV-01');
-    if (!usuarioId) throw fail('Usuário da abertura é obrigatório.');
-    if (!vendedorId) throw fail('Vendedor é obrigatório para abrir o caixa.');
-
-    const jaAberto = await getCaixaAberto({ usuarioId: usuarioId, vendedorId: vendedorId, terminal: terminal });
-    if (jaAberto) {
-      res.json(ok(publicDoc(jaAberto), 'Já existe caixa aberto para este usuário/vendedor/terminal.'));
-      return;
-    }
-
-    const vendedor = await findVendedor(vendedorId);
-    if (!vendedor || !isActive(vendedor.status)) throw fail('Vendedor não encontrado ou inativo.');
-
-    const caixa = {
-      publicId: makeId('cx'),
-      status: 'ABERTO',
-      usuarioId: usuarioId,
-      usuarioNome: asString(payload.usuarioNome),
-      vendedorId: vendedor.publicId || String(vendedor._id),
-      vendedorNome: vendedor.nome,
-      terminal: terminal,
-      lojaId: asString(payload.lojaId || 'matriz'),
-      valorInicial: asNumber(payload.valorInicial),
-      observacaoAbertura: asString(payload.observacao),
-      totais: {
-        dinheiro: 0,
-        pix: 0,
-        debito: 0,
-        credito: 0,
-        fiado: 0,
-        link: 0,
-        outros: 0,
-        bruto: 0,
-        desconto: 0,
-        liquido: 0,
-        cancelado: 0,
-        sangria: 0,
-        suprimento: 0
-      },
-      dataAbertura: nowIso(),
-      dataFechamento: '',
-      criadoEm: nowIso(),
-      atualizadoEm: nowIso()
+    const d = req.body || {}; const cpf = onlyDigits(d.cpfCnpj || d.cpf || d.cnpj);
+    let doc = null;
+    if (cpf) doc = await one('DtoPessoa', { CNPJ_CPF: cpf });
+    const payload = {
+      LastUpdate: nowIso(), PessoaFisica: cpf.length <= 11, NomeFantasia: s(d.nome) || s(d.razaoSocial) || 'Cliente', RazaoSocial: s(d.razaoSocial) || s(d.nome),
+      CNPJ_CPF: cpf || null, Telefone: s(d.telefone), Celular: s(d.whatsapp || d.celular), Email: s(d.email) || null,
+      Cliente: true, Vendedor: b(d.vendedor), CadastroInativo: false, Bloqueado: false,
+      Logradouro: s(d.logradouro) || null, LogradouroNumero: s(d.numero) || null, Bairro: s(d.bairro) || null, Cidade: s(d.cidade) || null, UF: s(d.uf) || null, CEP: onlyDigits(d.cep) || null,
+      DataCadastro: nowIso()
     };
-
-    const result = await database.collection('caixas').insertOne(caixa);
-    const saved = await database.collection('caixas').findOne({ _id: result.insertedId });
-    res.json(ok(publicDoc(saved), 'Caixa aberto com sucesso.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    if (doc) { await update('DtoPessoa', { _id: doc._id }, { $set: payload }); doc = Object.assign(doc, payload); }
+    else { payload._id = oid(); doc = await insert('DtoPessoa', payload); }
+    await writeLog('CLIENTE_WRITEBACK', { id: id(doc._id), nome: payload.NomeFantasia }, req.body.usuario || null);
+    res.json(ok(publicDoc(doc), 'Cliente salvo no white label.'));
+  } catch(e){sendError(res,e);}
 });
 
-app.post('/api/caixas/fechar', async function(req, res) {
+app.get('/api/usuarios', async (req, res) => { try { res.json(ok(publicDocs(await many('symplasys_usuarios', {}, { sort: { nome: 1 } })), 'Usuários carregados.')); } catch(e){sendError(res,e);} });
+app.post('/api/usuarios', async (req, res) => {
   try {
-    const database = await db();
-    const payload = req.body || {};
-    const caixaId = asString(payload.caixaId || payload.publicId || payload.mongoId);
-    if (!caixaId) throw fail('ID do caixa é obrigatório para fechamento.');
-
-    const query = toObjectIdOrNull(caixaId) ? { _id: toObjectIdOrNull(caixaId) } : { publicId: caixaId };
-    const caixa = await database.collection('caixas').findOne(query);
-    if (!caixa) throw fail('Caixa não encontrado.', 404);
-    if (caixa.status !== 'ABERTO') throw fail('Este caixa não está aberto.');
-
-    const totais = caixa.totais || {};
-    const valorInicial = asNumber(caixa.valorInicial);
-    const esperado = valorInicial + asNumber(totais.dinheiro) + asNumber(totais.suprimento) - asNumber(totais.sangria);
-    const valorInformado = asNumber(payload.valorInformado);
-    const diferenca = valorInformado - esperado;
-
-    await database.collection('caixas').updateOne(query, {
-      $set: {
-        status: 'FECHADO',
-        valorInformado: valorInformado,
-        valorEsperado: esperado,
-        diferenca: diferenca,
-        observacaoFechamento: asString(payload.observacao),
-        dataFechamento: nowIso(),
-        atualizadoEm: nowIso()
-      }
-    });
-
-    const saved = await database.collection('caixas').findOne(query);
-    res.json(ok(publicDoc(saved), 'Caixa fechado com sucesso.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    const d = req.body || {}; const email = s(d.email).toLowerCase(); if (!email || !d.senha) throw fail('Informe email e senha.', 400);
+    const salt = makeSalt();
+    let vendedor = null;
+    if (d.vendedorId) { try { vendedor = await one('DtoPessoa', { _id: new ObjectId(String(d.vendedorId)) }); } catch(e){} }
+    const doc = { _id: oid(), LastUpdate: nowIso(), nome: s(d.nome) || email, email, emailLower: email, passwordHash: hashText(salt + d.senha), salt,
+      perfil: s(d.perfil) || 'OPERADOR', ativo: d.ativo !== false, pessoaId: d.pessoaId || '', vendedorId: d.vendedorId || '', vendedorNome: vendedor ? vendedor.NomeFantasia : s(d.vendedorNome), permissoes: d.permissoes || ['PDV'] };
+    await update('symplasys_usuarios', { emailLower: email }, { $set: doc }, { upsert: true });
+    res.json(ok(publicDoc(doc), 'Usuário salvo.'));
+  } catch(e){sendError(res,e);}
 });
 
-app.post('/api/caixas/movimento', async function(req, res) {
+app.get('/api/caixa/aberto', async (req, res) => {
+  try { res.json(ok(publicDoc(await one('symplasys_caixas', { usuarioId: s(req.query.usuarioId), status: 'ABERTO' }, { abertoEm: -1 })), 'Caixa consultado.')); } catch(e){sendError(res,e);}
+});
+app.post('/api/caixa/abrir', async (req, res) => {
   try {
-    const database = await db();
-    const payload = req.body || {};
-    const caixaId = asString(payload.caixaId || payload.publicId || payload.mongoId);
-    const tipo = asString(payload.tipo).toUpperCase();
-    const valor = asNumber(payload.valor);
-    if (!caixaId) throw fail('ID do caixa é obrigatório.');
-    if (tipo !== 'SANGRIA' && tipo !== 'SUPRIMENTO') throw fail('Tipo precisa ser SANGRIA ou SUPRIMENTO.');
-    if (valor <= 0) throw fail('Valor do movimento precisa ser maior que zero.');
-
-    const query = toObjectIdOrNull(caixaId) ? { _id: toObjectIdOrNull(caixaId) } : { publicId: caixaId };
-    const caixa = await database.collection('caixas').findOne(query);
-    if (!caixa || caixa.status !== 'ABERTO') throw fail('Caixa aberto não encontrado.', 404);
-
-    const movimento = {
-      publicId: makeId('cxm'),
-      caixaId: caixa.publicId || String(caixa._id),
-      tipo: tipo,
-      valor: valor,
-      observacao: asString(payload.observacao),
-      usuarioId: asString(payload.usuarioId),
-      criadoEm: nowIso()
-    };
-
-    await database.collection('caixa_movimentos').insertOne(movimento);
-    const inc = tipo === 'SANGRIA' ? { 'totais.sangria': valor } : { 'totais.suprimento': valor };
-    await database.collection('caixas').updateOne(query, { $inc: inc, $set: { atualizadoEm: nowIso() } });
-    res.json(ok(publicDoc(movimento), 'Movimento registrado no caixa.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    const d = req.body || {}; if (!d.usuarioId) throw fail('Usuário obrigatório para abrir caixa.', 400);
+    const aberto = await one('symplasys_caixas', { usuarioId: s(d.usuarioId), status: 'ABERTO' }); if (aberto) return res.json(ok(publicDoc(aberto), 'Já existe caixa aberto.'));
+    const empresa = await getEmpresaPadrao();
+    const doc = { _id: oid(), LastUpdate: nowIso(), status: 'ABERTO', terminal: s(d.terminal) || 'PDV-01', usuarioId: s(d.usuarioId), usuarioNome: s(d.usuarioNome), vendedorId: s(d.vendedorId), vendedorNome: s(d.vendedorNome), valorInicial: n(d.valorInicial), observacaoAbertura: s(d.observacao), abertoEm: nowIso(), empresaId: empresa ? id(empresa._id) : '', empresaNome: empresa ? empresa.NomeFantasia : '' };
+    await insert('symplasys_caixas', doc);
+    await insert('DtoOperacaoPDV', { LastUpdate: nowIso(), TipoOperacao: 0, CaixaID: doc.usuarioId, CaixaNome: doc.usuarioNome, EmpresaID: doc.empresaId, EmpresaNome: doc.empresaNome, Data: nowIso(), UsuarioID: doc.usuarioId, UsuarioNome: doc.usuarioNome, Valores: [{ Descricao: 'Dinheiro', Pagamento: null, Valor: doc.valorInicial }], Valor: doc.valorInicial, Observacoes: doc.observacaoAbertura });
+    res.json(ok(publicDoc(doc), 'Caixa aberto e enviado ao white label.'));
+  } catch(e){sendError(res,e);}
+});
+app.post('/api/caixa/fechar', async (req, res) => {
+  try {
+    const d = req.body || {}; if (!d.caixaId) throw fail('Caixa obrigatório.', 400);
+    const caixa = await one('symplasys_caixas', { _id: new ObjectId(String(d.caixaId)) }); if (!caixa) throw fail('Caixa não encontrado.', 404);
+    const vendas = await many('symplasys_pdv_vendas', { caixaId: String(d.caixaId), status: 'CONCLUIDA' }, { limit: 5000 });
+    const total = vendas.reduce((a, v) => a + n(v.total), 0);
+    const informado = n(d.valorInformado);
+    const patch = { status: 'FECHADO', fechadoEm: nowIso(), totalVendas: total, valorInformado: informado, diferenca: informado - (n(caixa.valorInicial) + total), observacaoFechamento: s(d.observacao), LastUpdate: nowIso() };
+    await update('symplasys_caixas', { _id: caixa._id }, { $set: patch });
+    await insert('DtoOperacaoPDV', { LastUpdate: nowIso(), TipoOperacao: 1, CaixaID: caixa.usuarioId, CaixaNome: caixa.usuarioNome, EmpresaID: caixa.empresaId, EmpresaNome: caixa.empresaNome, Data: nowIso(), UsuarioID: caixa.usuarioId, UsuarioNome: caixa.usuarioNome, Valores: [{ Descricao: 'Total informado', Pagamento: null, Valor: informado }], Valor: informado, StatusFechamento: Math.abs(patch.diferenca) < 0.01 ? 'Normal' : 'Divergente', ValoresInformados: d.valoresInformados || null, Observacoes: s(d.observacao) });
+    res.json(ok(publicDoc(Object.assign(caixa, patch)), 'Caixa fechado e enviado ao white label.'));
+  } catch(e){sendError(res,e);}
 });
 
-function formaPagamentoCampo(forma) {
-  const text = asString(forma).toLowerCase();
-  if (text.indexOf('pix') >= 0) return 'pix';
-  if (text.indexOf('débito') >= 0 || text.indexOf('debito') >= 0) return 'debito';
-  if (text.indexOf('crédito') >= 0 || text.indexOf('credito') >= 0) return 'credito';
-  if (text.indexOf('fiado') >= 0 || text.indexOf('credi') >= 0) return 'fiado';
-  if (text.indexOf('link') >= 0) return 'link';
-  if (text.indexOf('dinheiro') >= 0) return 'dinheiro';
-  return 'outros';
+async function finalizarVenda(d, tipo) {
+  const empresa = await getEmpresaPadrao(); const consumidor = await getConsumidorNaoIdentificado();
+  const clienteId = d.clienteId || id(consumidor._id); let cliente = clienteId === id(consumidor._id) ? consumidor : null;
+  if (!cliente) { try { cliente = await one('DtoPessoa', { _id: new ObjectId(String(clienteId)) }) || consumidor; } catch(e) { cliente = consumidor; } }
+  let vendedorDoc = null; if (d.vendedorId) { try { vendedorDoc = await one('DtoPessoa', { _id: new ObjectId(String(d.vendedorId)) }); } catch(e){} }
+  let formaDoc = null; if (d.formaPagamentoId) { try { formaDoc = await one('DtoFormaPagamento', { _id: new ObjectId(String(d.formaPagamentoId)) }); } catch(e){} }
+  const codigo = await nextCodigo('DtoSequenciais', 'CodigoPedido', 1);
+  const itens = Array.isArray(d.itens) ? d.itens : [];
+  if (!itens.length) throw fail('Venda sem itens.', 400);
+  const totalItens = itens.reduce((a, it) => a + (n(it.qtd) * n(it.preco) - n(it.desconto)), 0);
+  const total = Math.max(0, totalItens - n(d.desconto) + n(d.frete) + n(d.acrescimo));
+  const venda = {
+    _id: oid(), LastUpdate: nowIso(), DepositoID: empresa && empresa.DepositoPadraoID || '', Deposito: empresa && empresa.DepositoPadrao || 'PADRÃO', Codigo: codigo,
+    Data: nowIso(), DataAprovacaoOrcamento: tipo === 'ORCAMENTO' ? '0001-01-01T00:00:00.000Z' : nowIso(), DataAprovacaoPedido: tipo === 'ORCAMENTO' ? '0001-01-01T00:00:00.000Z' : nowIso(),
+    Status: tipo === 'ORCAMENTO' ? 'Orçamento' : 'Pedido Faturado', Impresso: false, ImpressoDanfe: false, AlteradoPor: d.usuarioNome || 'SymplaSys PDV', Alteracao: nowIso(),
+    EmpresaId: empresa ? id(empresa._id) : '', Empresa: empresa ? empresa.NomeFantasia : '', ClienteId: id(cliente._id), Cliente: cliente.NomeFantasia || cliente.RazaoSocial || 'Consumidor não identificado',
+    VendedorID: d.vendedorId || null, VendedorPessoaID: d.vendedorId || null, Vendedor: vendedorDoc ? vendedorDoc.NomeFantasia : (d.vendedorNome || null),
+    Desconto: n(d.desconto), DescontoDinheiro: n(d.desconto), ValorFrete: n(d.frete), OutrasDespesas: n(d.acrescimo), ValorFinal: total, ValorTotalSemAcrescimos: totalItens, ValorTotalComAcrescimos: total,
+    Finalizado: tipo !== 'ORCAMENTO', Lancado: tipo !== 'ORCAMENTO', Enviado: false, OrigemVenda: 'SymplaSys PDV GAS', Plataforma: 'GAS',
+    FormadePagamentoID: d.formaPagamentoId || null, FormadePagamento: formaDoc ? formaDoc.Nome : (d.formaPagamentoNome || ''), PlanoDeContaID: empresa && empresa.PlanoDeContaPDVID || '', PlanoDeConta: empresa && empresa.PlanoDeContaPDV || '',
+    UsuarioID: d.usuarioId || '', Descricao: d.observacao || '', CPFNaNota: onlyDigits(d.cpfNota || '') || null, CaixaID: d.caixaId || null
+  };
+  await insert('DtoVenda', venda);
+  const vendaProdutos = [];
+  for (const it of itens) {
+    let prod = null; try { prod = await one('DtoProduto', { _id: new ObjectId(String(it.produtoId || it.id)) }); } catch(e) {}
+    const vp = { _id: oid(), LastUpdate: nowIso(), DepositoID: prod && prod.DepositoID || venda.DepositoID, Deposito: venda.Deposito, VendaID: id(venda._id), ProdutoID: id(prod && prod._id) || String(it.produtoId || it.id), Codigo: prod && prod.Codigo || it.codigo || '', CodigoNFE: prod && prod.CodigoNFe || it.codigoNFe || '', Unidade: prod && (prod.EstoqueUnidade || prod.UnidadeComercial_NFe) || 'UN', Descricao: (prod && prod.CodigoNFe ? prod.CodigoNFe + ' - ' : '') + (prod && prod.Nome || it.nome || ''), Marca: prod && prod.Marca || '', Quantidade: n(it.qtd), ValorUnitario: n(it.preco), ValorTotal: n(it.qtd) * n(it.preco) - n(it.desconto), ValorCustoUnitario: n(prod && prod.PrecoCusto), ValorCustoTotal: n(prod && prod.PrecoCusto) * n(it.qtd), DescontoTotal: n(it.desconto), Servico: prod && prod.IgnorarEstoque === true, GrupoTributario: prod && prod.GrupoTributario || null, NCM: prod && prod.NCM_NFe || null, CodigoCFOP: prod && prod.CFOPPadrao_NFe || null, IPI_Aliquota: n(prod && prod.IPI) };
+    await insert('DtoVendaProduto', vp); vendaProdutos.push(vp);
+    if (tipo !== 'ORCAMENTO' && !(prod && prod.IgnorarEstoque)) {
+      const estoque = await one('DtoEstoqueDepositoProduto', { ProdutoID: vp.ProdutoID });
+      const saldoAnterior = n(estoque && estoque.Saldo);
+      if (estoque) await update('DtoEstoqueDepositoProduto', { _id: estoque._id }, { $inc: { Saldo: -n(it.qtd) }, $set: { LastUpdate: nowIso(), UltimaAtualizacao: nowIso() } });
+      await insert('DtoEstoqueSaida', { _id: oid(), LastUpdate: nowIso(), CodigoProduto: vp.Codigo, CodigoProdutoNFE: String(vp.CodigoNFE || vp.Codigo || ''), VendaID: id(venda._id), ProdutoID: vp.ProdutoID, DepositoID: vp.DepositoID, Codigo: codigo, Produto: vp.Descricao, Deposito: vp.Deposito, Movimentacao: 'Venda', Quantidade: n(it.qtd), saldoMomentoMovimentacao: saldoAnterior, Unidade: vp.Unidade, ValorUnitario: vp.ValorUnitario, ValorTotal: vp.ValorTotal, Observacoes: 'Baixa de estoque ao finalizar venda no SymplaSys PDV GAS.', Cliente: venda.Cliente, ClienteID: venda.ClienteId, Data: nowIso(), VendaProdutoID: id(vp._id), UsuarioID: d.usuarioId || '', Usuario: d.usuarioNome || '' });
+    }
+  }
+  if (tipo !== 'ORCAMENTO') {
+    await insert('DtoLancamento', { _id: oid(), LastUpdate: nowIso(), LancamentoPaiId: null, EmpresaID: venda.EmpresaId, Empresa: venda.Empresa, ClienteID: venda.ClienteId, Cliente: venda.Cliente, CodigoSequencial: codigo, DataFluxo: nowIso(), DataVencimento: nowIso(), Pago: true, Conciliado: false, PlanoDeContaID: venda.PlanoDeContaID, PlanoDeConta: venda.PlanoDeConta || 'Receitas PDV', Descricao: 'Referente ao PEDIDO DE VENDA de codigo ' + codigo + ' efetuado no SymplaSys PDV GAS no valor de R$ ' + total.toFixed(2), FormaPagamentoID: venda.FormadePagamentoID, FormaPagamento: venda.FormadePagamento, Entrada: total, Saida: 0, Desconto: n(d.desconto), Despesa: false, DataPagamento: nowIso(), VendaID: id(venda._id), ValorPago: total, NumeroDocumento: 'Pedido ' + codigo, CriadoPor: d.usuarioNome || 'SymplaSys PDV GAS', ModificadoPor: d.usuarioNome || 'SymplaSys PDV GAS' });
+  }
+  await insert('symplasys_pdv_vendas', { _id: oid(), LastUpdate: nowIso(), vendaId: id(venda._id), codigo, tipo, status: tipo === 'ORCAMENTO' ? 'ORCAMENTO' : 'CONCLUIDA', caixaId: d.caixaId || '', usuarioId: d.usuarioId || '', usuarioNome: d.usuarioNome || '', vendedorId: d.vendedorId || '', vendedorNome: venda.Vendedor || '', clienteId: venda.ClienteId, cliente: venda.Cliente, total, formaPagamento: venda.FormadePagamento, itens: itens.length, payloadOriginal: d });
+  await writeLog(tipo === 'ORCAMENTO' ? 'ORCAMENTO_WRITEBACK' : 'VENDA_WRITEBACK', { vendaId: id(venda._id), codigo, total }, d.usuarioNome || null);
+  return { venda: publicDoc(venda), itens: publicDocs(vendaProdutos), codigo, total };
 }
+app.post('/api/pdv/venda/finalizar', async (req, res) => { try { res.json(ok(await finalizarVenda(req.body || {}, 'VENDA'), 'Venda enviada ao white label.')); } catch(e){sendError(res,e);} });
+app.post('/api/orcamentos', async (req, res) => { try { res.json(ok(await finalizarVenda(req.body || {}, 'ORCAMENTO'), 'Orçamento enviado ao white label.')); } catch(e){sendError(res,e);} });
+app.get('/api/pedidos', async (req, res) => { try { res.json(ok(publicDocs(await many('DtoVenda', {}, { limit: n(req.query.limit) || 100, sort: { Data: -1 } })), 'Pedidos carregados.')); } catch(e){sendError(res,e);} });
+app.get('/api/orcamentos', async (req, res) => { try { res.json(ok(publicDocs(await many('DtoVenda', { Status: /Orçamento/i }, { limit: n(req.query.limit) || 100, sort: { Data: -1 } })), 'Orçamentos carregados.')); } catch(e){sendError(res,e);} });
 
-app.post('/api/vendas', async function(req, res) {
+app.get('/api/fiscal/contexto', async (req, res) => { try { res.json(ok(await fiscalContext(), 'Contexto fiscal carregado.')); } catch(e){sendError(res,e);} });
+app.post('/api/fiscal/nfce/prevalidar', async (req, res) => {
   try {
-    const database = await db();
-    const payload = req.body || {};
-    const itens = Array.isArray(payload.itens) ? payload.itens : [];
-    if (!itens.length) throw fail('Adicione pelo menos um item na venda.');
-
-    const caixaId = asString(payload.caixaId);
-    if (!caixaId) throw fail('Venda PDV precisa estar vinculada a um caixa aberto.');
-    const caixaQuery = toObjectIdOrNull(caixaId) ? { _id: toObjectIdOrNull(caixaId) } : { publicId: caixaId };
-    const caixa = await database.collection('caixas').findOne(caixaQuery);
-    if (!caixa || caixa.status !== 'ABERTO') throw fail('Caixa aberto não encontrado para esta venda.');
-
-    const vendedor = await findVendedor(payload.vendedorId || caixa.vendedorId);
-    if (!vendedor || !isActive(vendedor.status)) throw fail('Vendedor não encontrado ou inativo.');
-    const cliente = await findCliente(payload.clienteId);
-
-    const produtosVenda = [];
-    let subtotal = 0;
-    for (let i = 0; i < itens.length; i += 1) {
-      const item = itens[i];
-      const produto = await findProduto(item.produtoId || item.sku || item.codigoBarras);
-      if (!produto || !isActive(produto.status)) throw fail('Produto não encontrado: ' + asString(item.produtoId || item.sku));
-      const qtde = asNumber(item.qtde || item.quantidade);
-      if (qtde <= 0) throw fail('Quantidade inválida para ' + produto.nome + '.');
-      const estoqueAtual = asNumber(produto.estoqueAtual);
-      if (estoqueAtual < qtde) throw fail('Estoque insuficiente para ' + produto.nome + '.');
-      const valorUnitario = asNumber(item.valorUnitario || produto.precoVenda);
-      const descontoItem = asNumber(item.descontoItem);
-      const totalItem = Math.max(0, qtde * valorUnitario - descontoItem);
-      subtotal += totalItem;
-      produtosVenda.push({ produto: produto, qtde: qtde, valorUnitario: valorUnitario, descontoItem: descontoItem, totalItem: totalItem });
-    }
-
-    const desconto = asNumber(payload.desconto);
-    const frete = asNumber(payload.frete);
-    const total = Math.max(0, subtotal - desconto + frete);
-    const numero = await nextSequence('pedido_numero', 1000);
-    const pedidoPublicId = makeId('ped');
-    const criadoEm = nowIso();
-    const formaPagamento = asString(payload.formaPagamento || 'Dinheiro');
-    const origem = asString(payload.origem || 'PDV');
-
-    const pedido = {
-      publicId: pedidoPublicId,
-      numero: numero,
-      caixaId: caixa.publicId || String(caixa._id),
-      clienteId: cliente ? (cliente.publicId || String(cliente._id)) : '',
-      clienteNome: cliente ? cliente.nome : 'Consumidor final',
-      vendedorId: vendedor.publicId || String(vendedor._id),
-      vendedorNome: vendedor.nome,
-      origem: origem,
-      status: 'Finalizado',
-      formaPagamento: formaPagamento,
-      subtotal: subtotal,
-      desconto: desconto,
-      frete: frete,
-      total: total,
-      observacao: asString(payload.observacao),
-      usuarioId: asString(payload.usuarioId || caixa.usuarioId),
-      criadoEm: criadoEm,
-      atualizadoEm: criadoEm
-    };
-
-    const pedidoResult = await database.collection('pedidos').insertOne(pedido);
-    const pedidoId = pedido.publicId || String(pedidoResult.insertedId);
-    const itensDocs = [];
-    const movimentosDocs = [];
-
-    for (let i = 0; i < produtosVenda.length; i += 1) {
-      const vendaItem = produtosVenda[i];
-      const produto = vendaItem.produto;
-      const saldoAnterior = asNumber(produto.estoqueAtual);
-      const saldoAtual = saldoAnterior - vendaItem.qtde;
-      await database.collection('produtos').updateOne({ _id: produto._id }, { $set: { estoqueAtual: saldoAtual, atualizadoEm: nowIso() } });
-      itensDocs.push({
-        publicId: makeId('pedit'),
-        pedidoId: pedidoId,
-        produtoId: produto.publicId || String(produto._id),
-        sku: produto.sku,
-        produtoNome: produto.nome,
-        qtde: vendaItem.qtde,
-        valorUnitario: vendaItem.valorUnitario,
-        descontoItem: vendaItem.descontoItem,
-        totalItem: vendaItem.totalItem,
-        criadoEm: criadoEm
-      });
-      movimentosDocs.push({
-        publicId: makeId('mov'),
-        pedidoId: pedidoId,
-        produtoId: produto.publicId || String(produto._id),
-        sku: produto.sku,
-        tipo: 'SAIDA_PDV',
-        quantidade: vendaItem.qtde,
-        saldoAnterior: saldoAnterior,
-        saldoAtual: saldoAtual,
-        observacao: 'Venda PDV #' + numero,
-        criadoEm: criadoEm
-      });
-    }
-
-    if (itensDocs.length) await database.collection('pedido_itens').insertMany(itensDocs);
-    if (movimentosDocs.length) await database.collection('estoque_movimentos').insertMany(movimentosDocs);
-
-    const campoPagamento = formaPagamentoCampo(formaPagamento);
-    const incCaixa = {
-      'totais.bruto': subtotal,
-      'totais.desconto': desconto,
-      'totais.liquido': total
-    };
-    incCaixa['totais.' + campoPagamento] = total;
-    await database.collection('caixas').updateOne(caixaQuery, {
-      $inc: incCaixa,
-      $set: { atualizadoEm: nowIso() },
-      $push: { vendaIds: pedidoId }
-    });
-
-    const savedPedido = await database.collection('pedidos').findOne({ _id: pedidoResult.insertedId });
-    res.json(ok({ pedido: publicDoc(savedPedido), itens: publicDocs(itensDocs) }, 'Venda registrada no MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    const ctx = await fiscalContext(); const erros = [];
+    if (!ctx.empresa || !ctx.empresa.CNPJ) erros.push('CNPJ da empresa não configurado.');
+    if (!ctx.nfe.configurado) erros.push('Certificado digital não configurado.');
+    if (!ctx.nfe.tokenConfigurado) erros.push('Token NFC-e não configurado.');
+    const itens = req.body.itens || []; itens.forEach((it, idx) => { if (!it.ncm) erros.push('Item ' + (idx + 1) + ' sem NCM.'); if (!it.cfop) erros.push('Item ' + (idx + 1) + ' sem CFOP.'); });
+    res.json(ok({ valido: erros.length === 0, erros, contexto: ctx }, erros.length ? 'Pendências fiscais encontradas.' : 'Pré-validação aprovada.'));
+  } catch(e){sendError(res,e);}
 });
-
-app.post('/api/admin/seed', async function(req, res) {
+app.post('/api/fiscal/nfce/emitir', async (req, res) => {
   try {
-    const database = await db();
-    const criadoEm = nowIso();
-    await database.collection('vendedores').updateOne(
-      { publicId: 'ven_padrao' },
-      { $set: normalizeVendedor({ publicId: 'ven_padrao', nome: 'Vendedor Padrão', status: 'Ativo' }), $setOnInsert: { criadoEm: criadoEm } },
-      { upsert: true }
-    );
-    await database.collection('clientes').updateOne(
-      { publicId: 'cli_consumidor_final' },
-      { $set: normalizeCliente({ publicId: 'cli_consumidor_final', nome: 'Consumidor final', status: 'Ativo' }), $setOnInsert: { criadoEm: criadoEm } },
-      { upsert: true }
-    );
-    await database.collection('produtos').updateOne(
-      { sku: 'SKU-001' },
-      { $set: normalizeProduto({ publicId: 'prd_exemplo', sku: 'SKU-001', nome: 'Produto Exemplo', categoria: 'Geral', precoVenda: 99.90, custo: 50, estoqueAtual: 15, estoqueMinimo: 3, status: 'Ativo' }), $setOnInsert: { criadoEm: criadoEm } },
-      { upsert: true }
-    );
-    res.json(ok({ inseridos: true }, 'Base inicial criada no MongoDB.'));
-  } catch (error) {
-    sendError(res, error);
-  }
+    const pre = await fiscalContext();
+    const doc = await insert('symplasys_fiscal_documentos', { _id: oid(), LastUpdate: nowIso(), tipo: 'NFCE', status: 'PENDENTE_API_FISCAL', vendaId: req.body.vendaId || '', payload: req.body, contextoSeguro: pre, observacao: 'Documento preparado. Conectar Focus/PlugNotas/Tecnospeed para autorização SEFAZ.' });
+    res.json(ok(publicDoc(doc), 'NFC-e preparada para API fiscal externa.'));
+  } catch(e){sendError(res,e);}
 });
 
-app.use(function(req, res) {
-  res.status(404).json({
-    success: false,
-    data: null,
-    message: 'Rota não encontrada.',
-    version: Date.now()
-  });
+app.get('/api/etiquetas/modelos', async (req, res) => { try { res.json(ok(publicDocs(await many('symplasys_etiqueta_modelos', {}, { sort: { nome: 1 } })), 'Modelos carregados.')); } catch(e){sendError(res,e);} });
+app.post('/api/etiquetas/modelos', async (req, res) => {
+  try { const d = req.body || {}; const doc = { _id: oid(), LastUpdate: nowIso(), nome: s(d.nome) || 'Modelo', larguraMm: n(d.larguraMm) || 50, alturaMm: n(d.alturaMm) || 30, colunas: n(d.colunas) || 3, linhas: n(d.linhas) || 8, fonte: n(d.fonte) || 10, exibirCodigoBarras: d.exibirCodigoBarras !== false, campos: d.campos || ['nome','preco','codigo'] }; await insert('symplasys_etiqueta_modelos', doc); res.json(ok(publicDoc(doc), 'Modelo salvo.')); } catch(e){sendError(res,e);}
 });
 
-async function start() {
-  try {
-    await connectMongo();
-    app.listen(PORT, function() {
-      console.log('[OK] API SymplaSys rodando na porta', PORT);
-      console.log('[OK] Health: http://localhost:' + PORT + '/health');
-    });
-  } catch (error) {
-    console.error('[ERRO] Falha ao iniciar API:', error.message);
-    process.exit(1);
-  }
-}
+app.get('/api/whatsapp/config', async (req, res) => { try { res.json(ok(publicDoc(await one('symplasys_whatsapp_config', {}) || {}), 'Config WhatsApp carregada.')); } catch(e){sendError(res,e);} });
+app.post('/api/whatsapp/config', async (req, res) => { try { const d = req.body || {}; await update('symplasys_whatsapp_config', {}, { $set: { LastUpdate: nowIso(), phoneNumberId: s(d.phoneNumberId), verifyToken: s(d.verifyToken), ativo: b(d.ativo), modoRobo: s(d.modoRobo) || 'assistido', mensagemPadrao: s(d.mensagemPadrao) } }, { upsert: true }); res.json(ok({}, 'Configuração salva.')); } catch(e){sendError(res,e);} });
+app.post('/api/whatsapp/fila', async (req, res) => { try { const doc = await insert('symplasys_whatsapp_fila', { _id: oid(), LastUpdate: nowIso(), status: 'PENDENTE', tipo: s(req.body.tipo) || 'MENSAGEM', destino: s(req.body.destino), mensagem: s(req.body.mensagem), payload: req.body }); res.json(ok(publicDoc(doc), 'Mensagem colocada na fila.')); } catch(e){sendError(res,e);} });
+app.get('/api/whatsapp/webhook', (req, res) => { res.send(req.query['hub.challenge'] || 'SymplaSys WhatsApp webhook'); });
+app.post('/api/whatsapp/webhook', async (req, res) => { try { await insert('symplasys_whatsapp_eventos', { _id: oid(), LastUpdate: nowIso(), payload: req.body }); res.json(ok({}, 'Evento recebido.')); } catch(e){sendError(res,e);} });
 
-process.on('SIGINT', async function() {
-  if (mongoClient) await mongoClient.close();
-  process.exit(0);
+app.get('/api/config/visual', async (req, res) => { try { res.json(ok(await getVisualConfig(), 'Visual carregado.')); } catch(e){sendError(res,e);} });
+app.post('/api/config/visual', async (req, res) => { try { const d = req.body || {}; await update('symplasys_config_visual', {}, { $set: { LastUpdate: nowIso(), nomeSistema: s(d.nomeSistema) || 'SymplaSys ERP', nomeEmpresa: s(d.nomeEmpresa), logoUrl: s(d.logoUrl), corPrimaria: s(d.corPrimaria) || '#262863', corSecundaria: s(d.corSecundaria) || '#6d5dfc', modoEscuro: b(d.modoEscuro), textoRodape: s(d.textoRodape) } }, { upsert: true }); res.json(ok(await getVisualConfig(), 'Visual salvo.')); } catch(e){sendError(res,e);} });
+
+app.get('/api/admin/collections', async (req, res) => {
+  try { const cols = await (await db()).listCollections().toArray(); res.json(ok(cols.filter(c => !String(c.name).startsWith('system.')).map(c => ({ name: c.name, type: c.type || 'collection' })), 'Collections carregadas.')); } catch(e){sendError(res,e);}
 });
+app.use((req, res) => res.status(404).json({ success: false, data: null, message: 'Rota não encontrada.', version: Date.now() }));
 
-start();
+app.listen(PORT, () => console.log('[OK] SymplaSys PDV White Label API online na porta ' + PORT));
