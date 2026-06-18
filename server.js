@@ -364,58 +364,90 @@ app.get('/api/produtos/:identificador', async function(req, res) {
 app.get('/api/admin/mapa-completo', async function(req, res) {
   try {
     const database = await db();
-    const limiteCollections = Math.min(Number(req.query.limiteCollections || 200), 500);
     const limiteAmostra = Math.min(Number(req.query.amostra || 3), 10);
-
     const collections = await database.listCollections().toArray();
-    const lista = [];
+    const mapa = [];
 
-    for (const col of collections.slice(0, limiteCollections)) {
+    function detectarModulo(nome, campos) {
+      const alvo = (String(nome) + ' ' + campos.join(' ')).toLowerCase();
+
+      if (alvo.includes('produto') || alvo.includes('product') || alvo.includes('sku') || alvo.includes('ean') || alvo.includes('codigo_barras')) return 'Produtos';
+      if (alvo.includes('cliente') || alvo.includes('customer') || alvo.includes('cpf') || alvo.includes('cnpj') || alvo.includes('telefone')) return 'Clientes / CRM';
+      if (alvo.includes('vendedor') || alvo.includes('seller') || alvo.includes('usuario') || alvo.includes('user')) return 'Usuários / Vendedores';
+      if (alvo.includes('estoque') || alvo.includes('stock') || alvo.includes('inventory') || alvo.includes('saldo')) return 'Estoque';
+      if (alvo.includes('pedido') || alvo.includes('order') || alvo.includes('sale') || alvo.includes('venda')) return 'Pedidos / Vendas';
+      if (alvo.includes('caixa') || alvo.includes('cash') || alvo.includes('pdv') || alvo.includes('terminal')) return 'Caixa / PDV';
+      if (alvo.includes('pagamento') || alvo.includes('payment') || alvo.includes('pix') || alvo.includes('card')) return 'Pagamentos';
+      if (alvo.includes('nota') || alvo.includes('nfce') || alvo.includes('nfe') || alvo.includes('fiscal')) return 'Fiscal';
+      if (alvo.includes('whatsapp') || alvo.includes('mensagem') || alvo.includes('message') || alvo.includes('chat')) return 'WhatsApp / Atendimento';
+      if (alvo.includes('marketplace') || alvo.includes('mercadolivre') || alvo.includes('magento') || alvo.includes('shopify')) return 'Marketplaces';
+      if (alvo.includes('fornecedor') || alvo.includes('supplier') || alvo.includes('compra') || alvo.includes('purchase')) return 'Compras / Fornecedores';
+      if (alvo.includes('empresa') || alvo.includes('company') || alvo.includes('loja') || alvo.includes('tenant')) return 'Empresas / Lojas';
+
+      return 'Não identificado';
+    }
+
+    for (const col of collections) {
       const nome = col.name;
-      const docs = await database.collection(nome).find({}).limit(limiteAmostra).toArray();
-      let totalEstimado = 0;
 
-      try {
-        totalEstimado = await database.collection(nome).estimatedDocumentCount();
-      } catch (e) {
-        totalEstimado = 0;
+      if (String(nome).indexOf('system.') === 0) {
+        mapa.push({
+          collection: nome,
+          ignorada: true,
+          motivo: 'Collection interna do MongoDB ignorada por segurança.',
+          moduloProvavel: 'Sistema MongoDB',
+          totalDocumentos: null,
+          campos: [],
+          amostra: []
+        });
+        continue;
       }
 
-      const campos = extrairCamposMapa_(docs);
-      const moduloInferido = inferirModuloSymplaSys_(nome, campos);
+      let total = 0;
+      let amostra = [];
+      let campos = [];
+      let erro = null;
 
-      lista.push({
+      try {
+        total = await database.collection(nome).countDocuments({});
+        amostra = await database.collection(nome).find({}).limit(limiteAmostra).toArray();
+
+        const mapaCampos = {};
+        amostra.forEach(function(doc) {
+          Object.keys(doc || {}).forEach(function(campo) {
+            mapaCampos[campo] = true;
+          });
+        });
+        campos = Object.keys(mapaCampos).slice(0, 120);
+      } catch (e) {
+        erro = e && e.message ? e.message : String(e);
+      }
+
+      mapa.push({
         collection: nome,
-        tipo: col.type || 'collection',
-        totalEstimado: totalEstimado,
-        moduloInferido: moduloInferido,
+        ignorada: false,
+        moduloProvavel: detectarModulo(nome, campos),
+        totalDocumentos: total,
         campos: campos,
-        amostra: docs.map(sanitizarDocMapa_)
+        amostra: typeof publicDocs === 'function' ? publicDocs(amostra) : amostra,
+        erro: erro
       });
     }
 
-    const mapaPorModulo = {};
-    lista.forEach(function(item) {
-      const modulo = item.moduloInferido.modulo || 'Nao identificado';
-      if (!mapaPorModulo[modulo]) mapaPorModulo[modulo] = [];
-      mapaPorModulo[modulo].push({
-        collection: item.collection,
-        totalEstimado: item.totalEstimado,
-        confianca: item.moduloInferido.confianca,
-        motivo: item.moduloInferido.motivo
-      });
+    mapa.sort(function(a, b) {
+      return String(a.collection).localeCompare(String(b.collection));
     });
 
-    res.json(ok({
-      banco: MONGODB_DB,
-      totalCollections: lista.length,
-      mapaPorModulo: mapaPorModulo,
-      collections: lista
-    }, 'Mapa completo do banco carregado.'));
+    return res.json(ok({
+      banco: process.env.MONGODB_DB,
+      totalCollections: mapa.length,
+      mapa: mapa
+    }, 'Mapa completo carregado.'));
   } catch (error) {
-    sendError(res, error);
+    return sendError(res, error);
   }
 });
+
 
 app.get('/api/admin/collections-detalhadas', async function(req, res) {
   try {
