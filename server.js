@@ -361,6 +361,236 @@ app.get('/api/produtos/:identificador', async function(req, res) {
   }
 });
 
+app.get('/api/admin/mapa-completo', async function(req, res) {
+  try {
+    const database = await db();
+    const limiteCollections = Math.min(Number(req.query.limiteCollections || 200), 500);
+    const limiteAmostra = Math.min(Number(req.query.amostra || 3), 10);
+
+    const collections = await database.listCollections().toArray();
+    const lista = [];
+
+    for (const col of collections.slice(0, limiteCollections)) {
+      const nome = col.name;
+      const docs = await database.collection(nome).find({}).limit(limiteAmostra).toArray();
+      let totalEstimado = 0;
+
+      try {
+        totalEstimado = await database.collection(nome).estimatedDocumentCount();
+      } catch (e) {
+        totalEstimado = 0;
+      }
+
+      const campos = extrairCamposMapa_(docs);
+      const moduloInferido = inferirModuloSymplaSys_(nome, campos);
+
+      lista.push({
+        collection: nome,
+        tipo: col.type || 'collection',
+        totalEstimado: totalEstimado,
+        moduloInferido: moduloInferido,
+        campos: campos,
+        amostra: docs.map(sanitizarDocMapa_)
+      });
+    }
+
+    const mapaPorModulo = {};
+    lista.forEach(function(item) {
+      const modulo = item.moduloInferido.modulo || 'Nao identificado';
+      if (!mapaPorModulo[modulo]) mapaPorModulo[modulo] = [];
+      mapaPorModulo[modulo].push({
+        collection: item.collection,
+        totalEstimado: item.totalEstimado,
+        confianca: item.moduloInferido.confianca,
+        motivo: item.moduloInferido.motivo
+      });
+    });
+
+    res.json(ok({
+      banco: MONGODB_DB,
+      totalCollections: lista.length,
+      mapaPorModulo: mapaPorModulo,
+      collections: lista
+    }, 'Mapa completo do banco carregado.'));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.get('/api/admin/collections-detalhadas', async function(req, res) {
+  try {
+    const database = await db();
+    const collections = await database.listCollections().toArray();
+    const lista = [];
+
+    for (const col of collections) {
+      const nome = col.name;
+      const exemplo = await database.collection(nome).findOne({});
+      let totalEstimado = 0;
+
+      try {
+        totalEstimado = await database.collection(nome).estimatedDocumentCount();
+      } catch (e) {
+        totalEstimado = 0;
+      }
+
+      const campos = exemplo ? Object.keys(exemplo).slice(0, 80) : [];
+      lista.push({
+        collection: nome,
+        tipo: col.type || 'collection',
+        totalEstimado: totalEstimado,
+        camposExemplo: campos,
+        moduloInferido: inferirModuloSymplaSys_(nome, campos)
+      });
+    }
+
+    lista.sort(function(a, b) {
+      return String(a.collection).localeCompare(String(b.collection));
+    });
+
+    res.json(ok(lista, 'Collections detalhadas carregadas.'));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.get('/api/admin/amostra/:collection', async function(req, res) {
+  try {
+    const collectionName = asString(req.params.collection);
+    const limite = Math.min(Number(req.query.limite || 5), 20);
+
+    if (!collectionName) throw fail('Informe o nome da collection.', 400);
+
+    const database = await db();
+    const docs = await database.collection(collectionName).find({}).limit(limite).toArray();
+
+    res.json(ok({
+      collection: collectionName,
+      totalAmostra: docs.length,
+      campos: extrairCamposMapa_(docs),
+      documentos: docs.map(sanitizarDocMapa_)
+    }, 'Amostra carregada.'));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+function sanitizarDocMapa_(doc) {
+  if (!doc) return null;
+  const bloqueados = ['senha', 'password', 'pass', 'token', 'secret', 'apikey', 'api_key', 'authorization', 'hash'];
+
+  function limpar(valor, caminho) {
+    if (valor === null || valor === undefined) return valor;
+
+    const chave = String(caminho || '').toLowerCase();
+    if (bloqueados.some(function(b) { return chave.indexOf(b) >= 0; })) {
+      return '***OCULTO***';
+    }
+
+    if (Array.isArray(valor)) {
+      return valor.slice(0, 5).map(function(v, i) { return limpar(v, caminho + '[' + i + ']'); });
+    }
+
+    if (valor instanceof Date) return valor.toISOString();
+
+    if (typeof valor === 'object') {
+      const out = {};
+      Object.keys(valor).slice(0, 80).forEach(function(k) {
+        if (k === '_id') out.mongoId = String(valor[k]);
+        else out[k] = limpar(valor[k], caminho ? caminho + '.' + k : k);
+      });
+      return out;
+    }
+
+    return valor;
+  }
+
+  return limpar(doc, '');
+}
+
+function extrairCamposMapa_(docs) {
+  const mapa = {};
+
+  function tipoValor(v) {
+    if (v === null || v === undefined) return 'vazio';
+    if (Array.isArray(v)) return 'array';
+    if (v instanceof Date) return 'data';
+    return typeof v;
+  }
+
+  function percorrer(obj, prefixo) {
+    if (!obj || typeof obj !== 'object') return;
+    Object.keys(obj).forEach(function(k) {
+      const caminho = prefixo ? prefixo + '.' + k : k;
+      const valor = obj[k];
+      if (!mapa[caminho]) mapa[caminho] = { campo: caminho, tipos: {}, ocorrencias: 0 };
+      mapa[caminho].tipos[tipoValor(valor)] = (mapa[caminho].tipos[tipoValor(valor)] || 0) + 1;
+      mapa[caminho].ocorrencias += 1;
+      if (valor && typeof valor === 'object' && !Array.isArray(valor) && !(valor instanceof Date)) {
+        percorrer(valor, caminho);
+      }
+    });
+  }
+
+  (docs || []).forEach(function(doc) { percorrer(doc, ''); });
+
+  return Object.keys(mapa).sort().map(function(campo) {
+    return mapa[campo];
+  });
+}
+
+function inferirModuloSymplaSys_(collectionName, camposEntrada) {
+  const nome = String(collectionName || '').toLowerCase();
+  const campos = (camposEntrada || []).map(function(c) {
+    return String(c.campo || c).toLowerCase();
+  });
+  const texto = nome + ' ' + campos.join(' ');
+
+  function score(palavras) {
+    let pontos = 0;
+    palavras.forEach(function(p) {
+      if (texto.indexOf(String(p).toLowerCase()) >= 0) pontos += 1;
+    });
+    return pontos;
+  }
+
+  const regras = [
+    { modulo: 'Produtos', palavras: ['produto', 'product', 'sku', 'ean', 'barcode', 'codigo_barras', 'preco', 'price', 'descricao', 'description', 'marca', 'brand'] },
+    { modulo: 'Estoque', palavras: ['estoque', 'stock', 'inventory', 'saldo', 'warehouse', 'deposito', 'quantidade', 'quantity', 'available'] },
+    { modulo: 'Clientes', palavras: ['cliente', 'customer', 'client', 'pessoa', 'person', 'cpf', 'cnpj', 'telefone', 'phone', 'whatsapp', 'endereco', 'address'] },
+    { modulo: 'Vendedores', palavras: ['vendedor', 'seller', 'salesman', 'salesperson', 'comissao', 'commission', 'meta', 'goal'] },
+    { modulo: 'Usuarios', palavras: ['usuario', 'user', 'login', 'email', 'senha', 'password', 'perfil', 'role', 'permission'] },
+    { modulo: 'Pedidos/Vendas', palavras: ['pedido', 'order', 'venda', 'sale', 'sales', 'total', 'subtotal', 'checkout', 'cart', 'carrinho'] },
+    { modulo: 'Itens de Pedido', palavras: ['order_item', 'pedido_item', 'sale_item', 'item', 'produtoid', 'productid', 'quantidade', 'unitario'] },
+    { modulo: 'Caixa/PDV', palavras: ['caixa', 'cash', 'cashier', 'pdv', 'terminal', 'abertura', 'fechamento', 'sangria', 'suprimento'] },
+    { modulo: 'Pagamentos', palavras: ['pagamento', 'payment', 'pix', 'cartao', 'card', 'recebimento', 'receivable', 'transaction'] },
+    { modulo: 'Fiscal', palavras: ['nfe', 'nfce', 'fiscal', 'invoice', 'xml', 'danfe', 'sefaz', 'chave'] },
+    { modulo: 'WhatsApp/Atendimento', palavras: ['whatsapp', 'chat', 'message', 'mensagem', 'conversation', 'conversa', 'atendimento'] },
+    { modulo: 'Marketplaces', palavras: ['marketplace', 'mercadolivre', 'magento', 'shopee', 'shopify', 'woocommerce', 'nuvemshop', 'channel'] },
+    { modulo: 'Empresas/Lojas', palavras: ['empresa', 'company', 'loja', 'store', 'tenant', 'filial', 'branch', 'business'] },
+    { modulo: 'Compras/Fornecedores', palavras: ['compra', 'purchase', 'fornecedor', 'supplier', 'entrada', 'invoice_purchase'] },
+    { modulo: 'Auditoria/Logs', palavras: ['log', 'audit', 'history', 'historico', 'event', 'evento'] },
+    { modulo: 'Configuracoes', palavras: ['config', 'setting', 'preference', 'parametro', 'parameter'] }
+  ];
+
+  let melhor = { modulo: 'Nao identificado', pontos: 0, palavras: [] };
+  regras.forEach(function(regra) {
+    const pontos = score(regra.palavras);
+    if (pontos > melhor.pontos) melhor = { modulo: regra.modulo, pontos: pontos, palavras: regra.palavras };
+  });
+
+  let confianca = 'baixa';
+  if (melhor.pontos >= 5) confianca = 'alta';
+  else if (melhor.pontos >= 2) confianca = 'media';
+
+  return {
+    modulo: melhor.modulo,
+    confianca: confianca,
+    pontos: melhor.pontos,
+    motivo: melhor.pontos ? 'Encontrou termos compatíveis no nome/campos.' : 'Não encontrou termos suficientes.'
+  };
+}
+
 app.post('/api/produtos', async function(req, res) {
   try {
     const database = await db();
